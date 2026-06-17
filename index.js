@@ -119,6 +119,40 @@ export default {
       server.send(JSON.stringify({ type: "welcome", clientId }));
 
       let currentDeviceId = null;
+      let cachedFormKey = null;
+
+      // 检查 R2 是否有新表单，有则推送
+      async function checkNewForm() {
+        try {
+          const obj = await bucket.get("form_index");
+          if (!obj) return;
+          const index = await obj.json();
+          if (!index.latestKey || index.latestKey === cachedFormKey) return;
+          const formObj = await bucket.get(index.latestKey);
+          if (!formObj) return;
+          const formData = await formObj.json();
+          server.send(JSON.stringify({
+            type: "form_submit",
+            data: formData,
+            formKey: index.latestKey
+          }));
+          cachedFormKey = index.latestKey;
+        } catch (e) {}
+      }
+
+      // 服务端定时检查 R2（5秒一次），无需设备心跳
+      const pollTimer = setInterval(async () => {
+        await checkNewForm();
+      }, 5000);
+
+      // WebSocket 关闭时清除定时器
+      server.addEventListener("close", () => {
+        clearInterval(pollTimer);
+      });
+
+      server.addEventListener("error", () => {
+        clearInterval(pollTimer);
+      });
 
       server.addEventListener("message", async (event) => {
         let data;
@@ -139,7 +173,9 @@ export default {
           return;
         }
 
-        if (data.type === "heartbeat") return;
+        if (data.type === "heartbeat") {
+          return;
+        }
         if (data.type === "command_result") { console.log("[result]", clientId, JSON.stringify(data)); return; }
         if (data.type === "form_ack") return;
 
