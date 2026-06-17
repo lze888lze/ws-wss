@@ -1,0 +1,10 @@
+name = "ws-wss"
+main = "index.js"
+compatibility_date = "2024-01-01"
+
+[triggers]
+crons = ["0 16 * * *"]
+
+[[r2_buckets]]
+binding = "WSS_BUCKET"
+bucket_name = "ws-wss"
