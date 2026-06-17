@@ -75,6 +75,9 @@ const FORM_HTML = `<!DOCTYPE html>
 
 // 全局连接管理
 const connections = new Map();
+const ONLINE_PREFIX = "ws_online/";
+const HEARTBEAT_TIMEOUT_MS = 30 * 1000;
+const CHECK_INTERVAL_MS = 5 * 1000;
 
 function broadcast(message) {
   const data = JSON.stringify(message);
@@ -83,27 +86,51 @@ function broadcast(message) {
   }
 }
 
-async function updateOnlineList(bucket, deviceId, isOnline) {
+function getOnlineKey(deviceId) {
+  return `${ONLINE_PREFIX}${encodeURIComponent(deviceId)}.json`;
+}
+
+async function markDeviceOnline(bucket, deviceId, connectionId) {
   if (!bucket || !deviceId) return;
   try {
-    let list = [];
-    const obj = await bucket.get("ws_online");
-    if (obj) {
-      list = await obj.json();
-      if (!Array.isArray(list)) list = [];
-    }
-    if (isOnline) {
-      list = list.filter(c => c.deviceId !== deviceId);
-      list.push({ deviceId, connectedAt: Date.now() });
-    } else {
-      list = list.filter(c => c.deviceId !== deviceId);
-    }
-    if (list.length === 0) {
-      await bucket.delete("ws_online");
-    } else {
-      await bucket.put("ws_online", JSON.stringify(list));
+    await bucket.put(getOnlineKey(deviceId), JSON.stringify({
+      deviceId,
+      connectionId,
+      connectedAt: Date.now()
+    }));
+  } catch (e) {}
+}
+
+async function markDeviceOffline(bucket, deviceId, connectionId) {
+  if (!bucket || !deviceId || !connectionId) return;
+  try {
+    const key = getOnlineKey(deviceId);
+    const obj = await bucket.get(key);
+    if (!obj) return;
+    const data = await obj.json();
+
+    // 防止旧连接超时后误删同一设备的新连接
+    if (data.connectionId === connectionId) {
+      await bucket.delete(key);
     }
   } catch (e) {}
+}
+
+async function countOnlineDevices(bucket) {
+  if (!bucket) return 0;
+  const uniqueDevices = new Set();
+  let cursor;
+
+  do {
+    const result = await bucket.list({ prefix: ONLINE_PREFIX, cursor });
+    for (const item of result.objects || []) {
+      const name = item.key.slice(ONLINE_PREFIX.length).replace(/\.json$/, "");
+      if (name) uniqueDevices.add(decodeURIComponent(name));
+    }
+    cursor = result.truncated ? result.cursor : undefined;
+  } while (cursor);
+
+  return uniqueDevices.size;
 }
 
 export default {
@@ -120,6 +147,8 @@ export default {
 
       let currentDeviceId = null;
       let cachedFormKey = null;
+      let lastHeartbeatAt = Date.now();
+      let closed = false;
 
       // 检查 R2 是否有新表单，有则推送
       async function checkNewForm() {
@@ -140,18 +169,30 @@ export default {
         } catch (e) {}
       }
 
-      // 服务端定时检查 R2（5秒一次），无需设备心跳
+      async function cleanupConnection() {
+        if (closed) return;
+        closed = true;
+        clearInterval(pollTimer);
+        connections.delete(clientId);
+        if (currentDeviceId) await markDeviceOffline(bucket, currentDeviceId, clientId);
+      }
+
+      // 服务端定时检查 R2 表单，并检查设备心跳超时
       const pollTimer = setInterval(async () => {
         await checkNewForm();
-      }, 5000);
+        if (currentDeviceId && Date.now() - lastHeartbeatAt > HEARTBEAT_TIMEOUT_MS) {
+          await cleanupConnection();
+          try { server.close(1000, "heartbeat timeout"); } catch (e) {}
+        }
+      }, CHECK_INTERVAL_MS);
 
       // WebSocket 关闭时清除定时器
       server.addEventListener("close", () => {
-        clearInterval(pollTimer);
+        cleanupConnection();
       });
 
       server.addEventListener("error", () => {
-        clearInterval(pollTimer);
+        cleanupConnection();
       });
 
       server.addEventListener("message", async (event) => {
@@ -161,8 +202,9 @@ export default {
         if (data.type === "register") {
           if (data.info && data.info.deviceId) {
             currentDeviceId = data.info.deviceId;
+            lastHeartbeatAt = Date.now();
             connections.set(clientId, { ws: server, deviceId: currentDeviceId });
-            await updateOnlineList(bucket, currentDeviceId, true);
+            await markDeviceOnline(bucket, currentDeviceId, clientId);
           }
           server.send(JSON.stringify({ type: "registered" }));
           return;
@@ -174,22 +216,13 @@ export default {
         }
 
         if (data.type === "heartbeat") {
+          lastHeartbeatAt = Date.now();
           return;
         }
         if (data.type === "command_result") { console.log("[result]", clientId, JSON.stringify(data)); return; }
         if (data.type === "form_ack") return;
 
         server.send(JSON.stringify({ type: "echo", data }));
-      });
-
-      server.addEventListener("close", async () => {
-        connections.delete(clientId);
-        if (currentDeviceId) await updateOnlineList(bucket, currentDeviceId, false);
-      });
-
-      server.addEventListener("error", async () => {
-        connections.delete(clientId);
-        if (currentDeviceId) await updateOnlineList(bucket, currentDeviceId, false);
       });
 
       return new Response(null, { status: 101, webSocket: client });
@@ -284,14 +317,8 @@ export default {
     if (url.pathname === "/api/status" && request.method === "GET") {
       try {
         if (!bucket) return new Response(JSON.stringify({ online: false, connections: 0 }), { headers: { "Content-Type": "application/json" } });
-        const obj = await bucket.get("ws_online");
-        let list = [];
-        if (obj) {
-          list = await obj.json();
-          if (!Array.isArray(list)) list = [];
-        }
-        const uniqueDevices = new Set(list.map(c => c.deviceId).filter(Boolean));
-        return new Response(JSON.stringify({ online: uniqueDevices.size > 0, connections: uniqueDevices.size }), { headers: { "Content-Type": "application/json" } });
+        const connections = await countOnlineDevices(bucket);
+        return new Response(JSON.stringify({ online: connections > 0, connections }), { headers: { "Content-Type": "application/json" } });
       } catch (e) {
         return new Response(JSON.stringify({ online: false, connections: 0 }), { headers: { "Content-Type": "application/json" } });
       }
