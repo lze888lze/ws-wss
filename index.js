@@ -146,17 +146,31 @@ export default {
       server.send(JSON.stringify({ type: "welcome", clientId }));
 
       let currentDeviceId = null;
-      let cachedFormKey = null;
+      let cachedFormKeys = new Set();
       let lastHeartbeatAt = Date.now();
       let closed = false;
+
+      // 连接建立时先记住 R2 里已有的最近指令，避免旧指令被当成新指令推送
+      async function initCachedFormKeys() {
+        try {
+          if (!bucket) return;
+          const obj = await bucket.get("form_index");
+          if (!obj) return;
+          const index = await obj.json();
+          const keys = Array.isArray(index.keys) ? index.keys.slice(0, 3) : [];
+          if (index.latestKey && !keys.includes(index.latestKey)) keys.unshift(index.latestKey);
+          cachedFormKeys = new Set(keys);
+        } catch (e) {}
+      }
 
       // 检查 R2 是否有新表单，有则推送
       async function checkNewForm() {
         try {
+          if (!bucket) return;
           const obj = await bucket.get("form_index");
           if (!obj) return;
           const index = await obj.json();
-          if (!index.latestKey || index.latestKey === cachedFormKey) return;
+          if (!index.latestKey || cachedFormKeys.has(index.latestKey)) return;
           const formObj = await bucket.get(index.latestKey);
           if (!formObj) return;
           const formData = await formObj.json();
@@ -165,7 +179,7 @@ export default {
             data: formData,
             formKey: index.latestKey
           }));
-          cachedFormKey = index.latestKey;
+          cachedFormKeys.add(index.latestKey);
         } catch (e) {}
       }
 
@@ -176,6 +190,8 @@ export default {
         connections.delete(clientId);
         if (currentDeviceId) await markDeviceOffline(bucket, currentDeviceId, clientId);
       }
+
+      await initCachedFormKeys();
 
       // 服务端定时检查 R2 表单，并检查设备心跳超时
       const pollTimer = setInterval(async () => {
